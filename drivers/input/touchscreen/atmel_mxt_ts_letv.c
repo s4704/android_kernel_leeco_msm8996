@@ -15,6 +15,7 @@
  */
 
 #include <linux/module.h>
+#include <linux/proc_fs.h>
 #include <linux/init.h>
 #include <linux/completion.h>
 #include <linux/delay.h>
@@ -352,6 +353,7 @@ struct mxt_data {
 	struct regulator *reg_vcc_i2c;
 	char *fw_name;
 	char *cfg_name;
+	bool keys_on;
 
 	/* Cached T8 configuration */
 	struct t81_configuration t81_cfg;
@@ -1310,6 +1312,10 @@ static void mxt_proc_t15_messages(struct mxt_data *data, u8 *msg)
 	bool curr_state, new_state;
 	bool sync = false;
 	unsigned long keystates = le32_to_cpu(msg[2]);
+
+	if(data->keys_on) {
+		return;
+	}
 
 	for (key = 0; key < data->pdata->t15_num_keys; key++) {
 		curr_state = test_bit(key, &data->t15_keystatus);
@@ -4039,6 +4045,35 @@ static ssize_t mxt_read_t25_store(struct device *dev,
 	return ret;
 }
 
+static ssize_t mxt_keys_on_show(struct device *dev,
+	struct device_attribute *attr, char *buf)
+{
+	struct mxt_data *data = dev_get_drvdata(dev);
+	int count;
+	char c;
+
+	c = data->keys_on ? '0' : '1';
+	count = sprintf(buf, "%c\n", c);
+
+	return count;
+}
+
+static ssize_t mxt_keys_on_store(struct device *dev,
+	struct device_attribute *attr, const char *buf, size_t count)
+{
+	struct mxt_data *data = dev_get_drvdata(dev);
+	int i;
+
+	if (sscanf(buf, "%u", &i) == 1 && i < 2) {
+		data->keys_on = (i == 0);
+
+		dev_dbg(dev, "%s\n", i ? "hw keys off" : "hw keys on");
+		return count;
+	} else {
+		dev_dbg(dev, "keys_on write error\n");
+		return -EINVAL;
+	}
+}
 
 #if 0  /* liuzhengliang temporary modification */
 static DEVICE_ATTR(fw_version, S_IRUGO, mxt_fw_version_show, NULL);
@@ -4063,6 +4098,9 @@ static DEVICE_ATTR(open_circuit_test, S_IRUGO,
 static DEVICE_ATTR(raw_cap_data, S_IRUGO, mxt_raw_cap_data_show, NULL);
 static DEVICE_ATTR(read_t25, S_IWUSR | S_IRUSR, mxt_read_t25_show, mxt_read_t25_store);
 
+static DEVICE_ATTR(keys_on, S_IWUSR | S_IRUSR, mxt_keys_on_show,
+			mxt_keys_on_store);
+
 
 static struct attribute *mxt_attrs[] = {
 //	&dev_attr_fw_version.attr, /* liuzhengliang temporary modification */
@@ -4080,6 +4118,7 @@ static struct attribute *mxt_attrs[] = {
 	//&dev_attr_open_circuit_test.attr,
 	//&dev_attr_raw_cap_data.attr,
 	&dev_attr_read_t25.attr,
+	&dev_attr_keys_on.attr,
 	NULL
 };
 
@@ -4103,6 +4142,40 @@ static const struct attribute_group *attr_groups[] ={
 	&attr_group,
 	NULL,
 };
+
+static int mxt_proc_init(struct kernfs_node *sysfs_node_parent)
+{
+	int ret = 0;
+	char *buf, *path = NULL;
+	char *key_disabler_sysfs_node;
+	struct proc_dir_entry *proc_entry_tp = NULL;
+	struct proc_dir_entry *proc_symlink_tmp  = NULL;
+
+	buf = kzalloc(PATH_MAX, GFP_KERNEL);
+	if (buf)
+		path = kernfs_path(sysfs_node_parent, buf, PATH_MAX);
+
+	proc_entry_tp = proc_mkdir("touchpanel", NULL);
+	if (proc_entry_tp == NULL) {
+		ret = -ENOMEM;
+		pr_err("%s: Couldn't create touchpanel\n", __func__);
+	}
+
+	key_disabler_sysfs_node = kzalloc(PATH_MAX, GFP_KERNEL);
+	if (key_disabler_sysfs_node)
+		sprintf(key_disabler_sysfs_node, "/sys%s/%s", path, "keys_on");
+	proc_symlink_tmp = proc_symlink("capacitive_keys_enable",
+			proc_entry_tp, key_disabler_sysfs_node);
+	if (proc_symlink_tmp == NULL) {
+		ret = -ENOMEM;
+		pr_err("%s: Couldn't create capacitive_keys_enable symlink\n", __func__);
+	}
+
+	kfree(buf);
+	kfree(key_disabler_sysfs_node);
+
+	return ret;
+}
 
 static void mxt_reset_slots(struct mxt_data *data)
 {
@@ -4851,6 +4924,9 @@ static int mxt_probe(struct i2c_client *client,
 		data->T6_reset_flag = 1;
 	}
 #endif
+
+	mxt_proc_init(client->dev.kobj.sd);
+
 	return 0;
 
 #if defined(CONFIG_FB_PM)
